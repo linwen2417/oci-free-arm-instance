@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
-  IMAGE_ID: "ocid1.image.oc1.ap-singapore-1.aaaaaaaa5a3xwkk5vaichk47fms2uzvsqeriats2uorf6kwgq3l3nwrbhipa"
+  IMAGE_ID: "ocid1.image.oc1.us-sanjose-1.aaaaaaaaputbo24b2twomwo6y3kxdo4ygjnoan26wixtbfuv7galmhwdy42a"
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
-  AD_NAME: "KClJ:AP-SINGAPORE-1-AD-1"
-  OCI_CLI_REGION: "ap-singapore-1"
+  AD_NAME: "UCGC:US-SANJOSE-1-AD-1"
+  OCI_CLI_REGION: "us-sanjose-1"
   OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
@@ -56,13 +56,13 @@ jobs:
             --compartment-id "$COMPARTMENT_ID" \
             --availability-domain "$AD_NAME" \
             --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+            --shape-config '{"ocpus":1,"memoryInGBs":2}' \
             --subnet-id "$SUBNET_ID" \
             --image-id "$IMAGE_ID" \
             --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
             --assign-public-ip true \
             --display-name "coolify-vm" \
-            --boot-volume-size-in-gbs 200 2>&1 || true)
+            --boot-volume-size-in-gbs 65 2>&1 || true)
 
           # Store the log as a GitHub step output
           echo "log_data<<EOF" >> $GITHUB_OUTPUT
