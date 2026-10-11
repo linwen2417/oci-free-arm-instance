@@ -1,96 +1,132 @@
 name: Try to Create OCI VM
-# It will run every 5 minutes.
+
 on:
   schedule:
     - cron: "*/5 * * * *"
-  # Allows you to manually run this workflow from the Actions tab
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Prevent two runs from trying to create the VM simultaneously.
+concurrency:
+  group: oci-free-arm-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
-  IMAGE_ID: "ocid1.image.oc1.us-sanjose-1.aaaaaaaawpuh2omgoyqorcgzyrozpjgi55rker4nblvxrtanzwtc6jchgoba"
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+  IMAGE_ID: "ocid1.image.oc1.us-sanjose-1.aaaaaaaawpuh2omgoyqorcgzyrozpjgi55rker4nblvxrtanzwtc6jchgoba"
   AD_NAME: "UCGC:US-SANJOSE-1-AD-1"
   OCI_CLI_REGION: "us-sanjose-1"
   OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+  DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Cache pip packages
-        id: cache-pip
+      - name: Cache OCI CLI
         uses: actions/cache@v4
         with:
           path: ~/.local
           key: ${{ runner.os }}-pip-oci-cli-v1
 
-      - name: Add OCI CLI to path
-        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Setup OCI CLI and Try to Create VM
-        id: create_vm
-        # This forces the job to succeed so the cache will save.
-        continue-on-error: true 
+      - name: Configure OCI CLI
+        shell: bash
         run: |
-          set -o pipefail
-
+          set -euo pipefail
           pip install oci-cli
+          mkdir -p "$HOME/.oci"
+          chmod 700 "$HOME/.oci"
+          printf '%s\n' "$OCI_CLI_KEY_CONTENT" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          {
+            echo '[DEFAULT]'
+            printf 'user=%s\n' "$OCI_CLI_USER"
+            printf 'tenancy=%s\n' "$OCI_CLI_TENANCY"
+            printf 'fingerprint=%s\n' "$OCI_CLI_FINGERPRINT"
+            printf 'key_file=%s/.oci/oci_api_key.pem\n' "$HOME"
+            printf 'region=%s\n' "$OCI_CLI_REGION"
+          } > "$HOME/.oci/config"
+          printf '%s\n' "$SSH_PUBLIC_KEY" > "$RUNNER_TEMP/my_ssh_key.pub"
 
-          mkdir -p ~/.oci
-          echo "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
+      - name: Check existing instance and create if needed
+        id: create_vm
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo "[DEFAULT]" > ~/.oci/config
-          echo "user=${{ secrets.OCI_CLI_USER }}" >> ~/.oci/config
-          echo "tenancy=${{ secrets.OCI_CLI_TENANCY }}" >> ~/.oci/config
-          echo "fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}" >> ~/.oci/config
-          echo "key_file=~/.oci/oci_api_key.pem" >> ~/.oci/config
-          echo "region=${{ env.OCI_CLI_REGION }}" >> ~/.oci/config
-          echo "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
+          # Do not create another instance if coolify-vm already exists.
+          EXISTING=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "coolify-vm" \
+            --all | jq '[.data[] | select(."lifecycle-state" != "TERMINATED" and ."lifecycle-state" != "TERMINATING")] | length')
 
-          # Run the command, capture ALL output, and use '|| true' to prevent the script from exiting early.
-          OCI_OUTPUT=$(oci compute instance launch \
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "coolify-vm already exists; skipping launch."
+            echo 'result=exists' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Capture the actual OCI command exit code; do not swallow errors.
+          set +e
+          oci compute instance launch \
             --compartment-id "$COMPARTMENT_ID" \
             --availability-domain "$AD_NAME" \
             --shape "VM.Standard.A1.Flex" \
             --shape-config '{"ocpus":1,"memoryInGBs":2}' \
             --subnet-id "$SUBNET_ID" \
             --image-id "$IMAGE_ID" \
-            --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+            --ssh-authorized-keys-file "$RUNNER_TEMP/my_ssh_key.pub" \
             --assign-public-ip true \
             --display-name "coolify-vm" \
-            --boot-volume-size-in-gbs 65 2>&1 || true)
+            --boot-volume-size-in-gbs 65 \
+            --query 'data.id' --raw-output \
+            > "$RUNNER_TEMP/oci.out" 2> "$RUNNER_TEMP/oci.err"
+          STATUS=$?
+          set -e
 
-          # Store the log as a GitHub step output
-          echo "log_data<<EOF" >> $GITHUB_OUTPUT
-          echo "$OCI_OUTPUT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-          # Check the log content for an error string.
-          if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-            echo "Success! 'PROVISIONING' state found in output."
+          if [ "$STATUS" -eq 0 ]; then
+            INSTANCE_ID=$(tr -d '\r\n' < "$RUNNER_TEMP/oci.out")
+            if [[ "$INSTANCE_ID" != ocid1.instance.* ]]; then
+              echo "Launch returned an unexpected instance ID; check OCI Console before retrying."
+              exit 1
+            fi
+            echo "Created OCI instance: $INSTANCE_ID"
+            echo 'result=created' >> "$GITHUB_OUTPUT"
+            echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
             exit 0
-          else
-            echo "Error: Success string not found in OCI output. Failing the step."
-            exit 1
           fi
 
-      - name: Send Discord Notification
-        if: always()
-        uses: sarisia/actions-status-discord@v1.15.4
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          title: "OCI VM Status: ${{ steps.create_vm.outcome }}"
-          status: ${{ steps.create_vm.outcome }}
-          color: ${{ steps.create_vm.outcome == 'success' && '0x28a745' || '0xdc3545' }}
-          description: |
-            Attempt to create A1.Flex VM.
-            **Status:** `${{ steps.create_vm.outcome }}`
+          cat "$RUNNER_TEMP/oci.err"
+          if grep -Eqi 'OutOfHostCapacity|Out of host capacity|insufficient host capacity' "$RUNNER_TEMP/oci.err"; then
+            echo 'result=no_capacity' >> "$GITHUB_OUTPUT"
+            echo 'No A1 capacity now; the next scheduled run will retry.'
+            exit 0
+          fi
 
-            **Log Output:**
-            ```json
-            ${{ steps.create_vm.outputs.log_data }}
-            ```
+          echo 'result=error' >> "$GITHUB_OUTPUT"
+          exit "$STATUS"
+
+      - name: Notify Discord only when a new VM is created
+        if: ${{ steps.create_vm.outputs.result == 'created' }}
+        env:
+          INSTANCE_ID: ${{ steps.create_vm.outputs.instance_id }}
+        shell: bash
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo 'Discord webhook not configured; skipping notification.'
+            exit 0
+          fi
+          jq -n --arg content "OCI A1.Flex VM created in San Jose! Instance: $INSTANCE_ID" \
+            '{content: $content}' | \
+            curl -fsS -H 'Content-Type: application/json' -d @- "$DISCORD_WEBHOOK_URL"
